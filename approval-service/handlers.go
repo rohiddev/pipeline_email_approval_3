@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-
-	"github.com/google/uuid"
 )
 
 type handlers struct {
@@ -148,7 +146,7 @@ func (h *handlers) review(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Save SSO state so the callback knows which reference this flow is for
-	state := uuid.New().String()
+	state := newUUID()
 	if err := h.store.SaveState(state, reference); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

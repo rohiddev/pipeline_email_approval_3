@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // Approval represents one access request and its current state.
@@ -136,7 +134,7 @@ func (s *store) Create(
 	requester, requesterEmail, managerEmail, adGroup, reason, pipelineID string,
 	ttlHours int,
 ) (*Approval, error) {
-	token := uuid.New().String()
+	token := newUUID()
 	now := time.Now().UTC()
 	expires := now.Add(time.Duration(ttlHours) * time.Hour)
 
@@ -227,7 +225,7 @@ func (s *store) Decide(token, decision, decidedBy, ip string) error {
 // ttlHours should be short (e.g. 4) — this is the window for the email link,
 // not the overall approval window (which is longer).
 func (s *store) CreateReference(token string, ttlHours int) (*EmailReference, error) {
-	ref := uuid.New().String()
+	ref := newUUID()
 	expires := time.Now().UTC().Add(time.Duration(ttlHours) * time.Hour)
 	_, err := s.db.Exec(`
 		INSERT INTO email_references (reference, token, expires_at)
@@ -301,7 +299,7 @@ func (s *store) UseReference(reference string) (*EmailReference, error) {
 // Bound to a specific approval token + manager email — cannot be reused
 // for a different request or by a different person.
 func (s *store) CreateCSRF(approvalToken, managerEmail string) string {
-	csrf := uuid.New().String()
+	csrf := newUUID()
 	expires := time.Now().UTC().Add(30 * time.Minute)
 	s.db.Exec(`
 		INSERT INTO csrf_tokens (token, manager, expires_at) VALUES (?, ?, ?)`,
