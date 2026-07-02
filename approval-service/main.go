@@ -4,15 +4,13 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
 type config struct {
 	ListenAddr      string
 	BaseURL         string
-	DBPath          string
+	MongoURI        string // e.g. mongodb://localhost:27017
+	MongoDB         string // database name
 	InternalAPIKey  string
 	TokenTTLHours   int // total approval window (e.g. 48h)
 	RefTTLHours     int // email link lifetime (e.g. 4h) — shorter than approval window
@@ -28,15 +26,16 @@ func configFromEnv() config {
 	return config{
 		ListenAddr:      envOr("LISTEN_ADDR", ":8000"),
 		BaseURL:         envOr("BASE_URL", "http://localhost:8000"),
-		DBPath:          envOr("DB_PATH", "./approvals.db"),
-		InternalAPIKey:  os.Getenv("INTERNAL_API_KEY"),
+		MongoURI:        envOr("MONGODB_URI", "mongodb://localhost:27017"),
+		MongoDB:         envOr("MONGODB_DB", "approval_service"),
+		InternalAPIKey:  envOr("INTERNAL_API_KEY", ""),
 		TokenTTLHours:   envInt("TOKEN_TTL_HOURS", 48),
-		RefTTLHours:     envInt("REF_TTL_HOURS", 4), // email link expires in 4 hours
-		SSOAuthURL:      os.Getenv("SSO_AUTH_URL"),
-		SSOTokenURL:     os.Getenv("SSO_TOKEN_URL"),
-		SSOUserInfoURL:  os.Getenv("SSO_USERINFO_URL"),
-		SSOClientID:     os.Getenv("SSO_CLIENT_ID"),
-		SSOClientSecret: os.Getenv("SSO_CLIENT_SECRET"),
+		RefTTLHours:     envInt("REF_TTL_HOURS", 4),
+		SSOAuthURL:      envOr("SSO_AUTH_URL", ""),
+		SSOTokenURL:     envOr("SSO_TOKEN_URL", ""),
+		SSOUserInfoURL:  envOr("SSO_USERINFO_URL", ""),
+		SSOClientID:     envOr("SSO_CLIENT_ID", ""),
+		SSOClientSecret: envOr("SSO_CLIENT_SECRET", ""),
 	}
 }
 
@@ -50,9 +49,9 @@ func main() {
 		log.Println("WARN: SSO not configured — running in dev mode, no identity verification")
 	}
 
-	store, err := newStore(cfg.DBPath)
+	store, err := newStore(cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
-		log.Fatalf("cannot open database: %v", err)
+		log.Fatalf("cannot connect to MongoDB: %v", err)
 	}
 	defer store.close()
 

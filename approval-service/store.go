@@ -1,13 +1,17 @@
-// store.go — all database operations in one place.
+// store.go — all database operations using MongoDB.
 package main
 
 import (
+	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // Approval represents one access request and its current state.
@@ -23,107 +27,84 @@ type Approval struct {
 	CreatedAt           time.Time
 	ExpiresAt           time.Time
 	DecidedAt           *time.Time
-	DecidedBy           *string // verified SSO email of the person who actioned
+	DecidedBy           *string
 	DecidedFromIP       *string
 }
 
 // EmailReference is what goes in the email URL — never the real token.
-// The real token is looked up server-side after SSO verifies the manager.
-// Short-lived and single-use: once clicked and verified, it is deleted.
 type EmailReference struct {
 	Reference string
-	Token     string    // the real approval token — never exposed in URLs
-	ExpiresAt time.Time // short window — manager must act within this time
+	Token     string
+	ExpiresAt time.Time
 }
 
 // SSOState links an SSO state param back to an email reference.
-// Created on email link click, deleted after callback.
 type SSOState struct {
 	State     string
 	Reference string
 }
 
 type store struct {
-	db *sql.DB
+	client     *mongo.Client
+	approvals  *mongo.Collection
+	references *mongo.Collection
+	ssoStates  *mongo.Collection
+	csrfTokens *mongo.Collection
+	auditLog   *mongo.Collection
 }
 
-func newStore(path string) (*store, error) {
-	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL")
+func newStore(uri, dbName string) (*store, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("connect to MongoDB: %w", err)
 	}
-	s := &store{db: db}
-	return s, s.migrate()
+	if err := client.Ping(ctx, nil); err != nil {
+		return nil, fmt.Errorf("ping MongoDB: %w", err)
+	}
+
+	db := client.Database(dbName)
+	s := &store{
+		client:     client,
+		approvals:  db.Collection("approvals"),
+		references: db.Collection("email_references"),
+		ssoStates:  db.Collection("sso_states"),
+		csrfTokens: db.Collection("csrf_tokens"),
+		auditLog:   db.Collection("audit_log"),
+	}
+	return s, s.ensureIndexes()
 }
 
-func (s *store) close() { s.db.Close() }
+func (s *store) close() {
+	s.client.Disconnect(context.Background())
+}
 
-func (s *store) migrate() error {
-	_, err := s.db.Exec(`
-		-- csrf_tokens: one-time tokens that tie the review form POST back to the
-		-- verified manager identity from the SSO callback.
-		-- Prevents the form being submitted from another tab or forged externally.
-		CREATE TABLE IF NOT EXISTS csrf_tokens (
-			token       TEXT NOT NULL,
-			manager     TEXT NOT NULL,
-			expires_at  DATETIME NOT NULL,
-			used        INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY (token, manager)
-		);
-	`)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS approvals (
-			token                 TEXT PRIMARY KEY,
-			status                TEXT NOT NULL DEFAULT 'pending',
-			requester             TEXT NOT NULL,
-			requester_email       TEXT NOT NULL,
-			manager_email         TEXT NOT NULL,
-			ad_group              TEXT NOT NULL,
-			reason                TEXT NOT NULL,
-			pipeline_execution_id TEXT NOT NULL,
-			created_at            DATETIME NOT NULL,
-			expires_at            DATETIME NOT NULL,
-			decided_at            DATETIME,
-			decided_by            TEXT,
-			decided_from_ip       TEXT
-		);
+// ensureIndexes creates TTL indexes so MongoDB auto-deletes expired documents.
+// Short-lived records (references, SSO states, CSRF tokens) clean themselves up.
+func (s *store) ensureIndexes() error {
+	ctx := context.Background()
 
-		-- email_references: what goes in the email URL.
-		-- The real token never appears in a URL or email body.
-		-- expires_at is short (configurable, default 4 hours) so a leaked
-		-- reference from email logs is useless after that window.
-		CREATE TABLE IF NOT EXISTS email_references (
-			reference  TEXT PRIMARY KEY,
-			token      TEXT NOT NULL,
-			expires_at DATETIME NOT NULL,
-			used       INTEGER NOT NULL DEFAULT 0
-		);
+	// Email references expire on their expires_at field
+	s.references.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(0),
+	})
 
-		-- sso_states: transient records linking an SSO flow back to a reference.
-		-- Created on email link click, deleted after the SSO callback returns.
-		CREATE TABLE IF NOT EXISTS sso_states (
-			state      TEXT PRIMARY KEY,
-			reference  TEXT NOT NULL,
-			created_at DATETIME NOT NULL
-		);
+	// SSO states auto-delete after 1 hour regardless of created_at value
+	s.ssoStates.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(3600),
+	})
 
-		-- audit_log: append-only, hash-chained.
-		-- Each record includes the SHA-256 hash of the previous record.
-		-- Any tampering with a record breaks every hash after it — detectable.
-		-- Never UPDATE or DELETE from this table.
-		CREATE TABLE IF NOT EXISTS audit_log (
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			event         TEXT NOT NULL,
-			data          TEXT NOT NULL,
-			timestamp     TEXT NOT NULL,
-			previous_hash TEXT NOT NULL,
-			hash          TEXT NOT NULL
-		);
-	`)
-	return err
+	// CSRF tokens expire on their expires_at field
+	s.csrfTokens.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(0),
+	})
+
+	return nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -138,14 +119,18 @@ func (s *store) Create(
 	now := time.Now().UTC()
 	expires := now.Add(time.Duration(ttlHours) * time.Hour)
 
-	_, err := s.db.Exec(`
-		INSERT INTO approvals
-		(token, requester, requester_email, manager_email, ad_group, reason,
-		 pipeline_execution_id, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		token, requester, requesterEmail, managerEmail, adGroup, reason,
-		pipelineID, now, expires,
-	)
+	_, err := s.approvals.InsertOne(context.Background(), bson.M{
+		"_id":                   token,
+		"status":                "pending",
+		"requester":             requester,
+		"requester_email":       requesterEmail,
+		"manager_email":         managerEmail,
+		"ad_group":              adGroup,
+		"reason":                reason,
+		"pipeline_execution_id": pipelineID,
+		"created_at":            now,
+		"expires_at":            expires,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("insert approval: %w", err)
 	}
@@ -159,58 +144,59 @@ func (s *store) Create(
 }
 
 func (s *store) Get(token string) (*Approval, error) {
-	row := s.db.QueryRow(`
-		SELECT token, status, requester, requester_email, manager_email,
-		       ad_group, reason, pipeline_execution_id,
-		       created_at, expires_at, decided_at, decided_by, decided_from_ip
-		FROM approvals WHERE token = ?`, token)
-
-	a := &Approval{}
-	var decidedAt sql.NullTime
-	var decidedBy, decidedFromIP sql.NullString
-
-	err := row.Scan(
-		&a.Token, &a.Status, &a.Requester, &a.RequesterEmail, &a.ManagerEmail,
-		&a.ADGroup, &a.Reason, &a.PipelineExecutionID,
-		&a.CreatedAt, &a.ExpiresAt, &decidedAt, &decidedBy, &decidedFromIP,
-	)
-	if err == sql.ErrNoRows {
+	var doc bson.M
+	err := s.approvals.FindOne(context.Background(), bson.M{"_id": token}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
 		return nil, fmt.Errorf("not found")
 	}
 	if err != nil {
 		return nil, err
 	}
-	if decidedAt.Valid {
-		t := decidedAt.Time
-		a.DecidedAt = &t
+
+	a := &Approval{
+		Token:               token,
+		Status:              str(doc, "status"),
+		Requester:           str(doc, "requester"),
+		RequesterEmail:      str(doc, "requester_email"),
+		ManagerEmail:        str(doc, "manager_email"),
+		ADGroup:             str(doc, "ad_group"),
+		Reason:              str(doc, "reason"),
+		PipelineExecutionID: str(doc, "pipeline_execution_id"),
+		CreatedAt:           timeVal(doc, "created_at"),
+		ExpiresAt:           timeVal(doc, "expires_at"),
+		DecidedAt:           timePtr(doc, "decided_at"),
+		DecidedBy:           strPtr(doc, "decided_by"),
+		DecidedFromIP:       strPtr(doc, "decided_from_ip"),
 	}
-	if decidedBy.Valid {
-		a.DecidedBy = &decidedBy.String
-	}
-	if decidedFromIP.Valid {
-		a.DecidedFromIP = &decidedFromIP.String
-	}
+
+	// Lazily mark expired
 	if a.Status == "pending" && time.Now().UTC().After(a.ExpiresAt) {
 		a.Status = "expired"
-		s.db.Exec(`UPDATE approvals SET status = 'expired' WHERE token = ?`, token)
+		s.approvals.UpdateOne(context.Background(),
+			bson.M{"_id": token},
+			bson.M{"$set": bson.M{"status": "expired"}},
+		)
 	}
 	return a, nil
 }
 
-// Decide records the decision. Uses WHERE status='pending' so it is idempotent
-// and a second click on the same link does nothing.
+// Decide records the decision atomically.
+// The filter on status="pending" means a second click does nothing.
 func (s *store) Decide(token, decision, decidedBy, ip string) error {
-	res, err := s.db.Exec(`
-		UPDATE approvals
-		SET status = ?, decided_at = ?, decided_by = ?, decided_from_ip = ?
-		WHERE token = ? AND status = 'pending'`,
-		decision, time.Now().UTC(), decidedBy, ip, token,
+	res, err := s.approvals.UpdateOne(
+		context.Background(),
+		bson.M{"_id": token, "status": "pending"},
+		bson.M{"$set": bson.M{
+			"status":          decision,
+			"decided_at":      time.Now().UTC(),
+			"decided_by":      decidedBy,
+			"decided_from_ip": ip,
+		}},
 	)
 	if err != nil {
 		return err
 	}
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
+	if res.MatchedCount == 0 {
 		return fmt.Errorf("already decided or not found")
 	}
 	return nil
@@ -218,134 +204,134 @@ func (s *store) Decide(token, decision, decidedBy, ip string) error {
 
 // ─────────────────────────────────────────────────────────────
 // Email reference operations
-// Fix 1: token never appears in a URL
+// Fix 1: real token never appears in a URL
 // ─────────────────────────────────────────────────────────────
 
-// CreateReference generates a short-lived opaque reference for the email link.
-// ttlHours should be short (e.g. 4) — this is the window for the email link,
-// not the overall approval window (which is longer).
 func (s *store) CreateReference(token string, ttlHours int) (*EmailReference, error) {
 	ref := newUUID()
 	expires := time.Now().UTC().Add(time.Duration(ttlHours) * time.Hour)
-	_, err := s.db.Exec(`
-		INSERT INTO email_references (reference, token, expires_at)
-		VALUES (?, ?, ?)`, ref, token, expires,
-	)
+	_, err := s.references.InsertOne(context.Background(), bson.M{
+		"_id":       ref,
+		"token":     token,
+		"expires_at": expires,
+		"used":      false,
+	})
 	if err != nil {
 		return nil, err
 	}
 	return &EmailReference{Reference: ref, Token: token, ExpiresAt: expires}, nil
 }
 
-// PeekReference checks a reference is valid without consuming it.
-// Used in the review handler to validate before redirecting to SSO.
+// PeekReference checks validity without consuming the reference.
 func (s *store) PeekReference(reference string) (*EmailReference, error) {
-	row := s.db.QueryRow(`
-		SELECT reference, token, expires_at, used
-		FROM email_references WHERE reference = ?`, reference)
-	var ref EmailReference
-	var used int
-	if err := row.Scan(&ref.Reference, &ref.Token, &ref.ExpiresAt, &used); err != nil {
-		return nil, fmt.Errorf("not found")
+	var doc bson.M
+	err := s.references.FindOne(context.Background(), bson.M{
+		"_id":        reference,
+		"used":       false,
+		"expires_at": bson.M{"$gt": time.Now().UTC()},
+	}).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("not found, already used, or expired")
 	}
-	if used == 1 {
-		return nil, fmt.Errorf("already used")
-	}
-	if time.Now().UTC().After(ref.ExpiresAt) {
-		return nil, fmt.Errorf("expired")
-	}
-	return &ref, nil
-}
-
-// UseReference retrieves the real token for a reference and marks it used.
-// Single-use: a second call with the same reference returns an error.
-func (s *store) UseReference(reference string) (*EmailReference, error) {
-	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	return &EmailReference{
+		Reference: reference,
+		Token:     str(doc, "token"),
+		ExpiresAt: timeVal(doc, "expires_at"),
+	}, nil
+}
 
-	row := tx.QueryRow(`
-		SELECT reference, token, expires_at, used
-		FROM email_references WHERE reference = ?`, reference)
-
-	var ref EmailReference
-	var used int
-	if err := row.Scan(&ref.Reference, &ref.Token, &ref.ExpiresAt, &used); err != nil {
-		return nil, fmt.Errorf("reference not found")
+// UseReference atomically retrieves and marks the reference used (single use).
+func (s *store) UseReference(reference string) (*EmailReference, error) {
+	var doc bson.M
+	err := s.references.FindOneAndUpdate(
+		context.Background(),
+		bson.M{
+			"_id":        reference,
+			"used":       false,
+			"expires_at": bson.M{"$gt": time.Now().UTC()},
+		},
+		bson.M{"$set": bson.M{"used": true}},
+		options.FindOneAndUpdate().SetReturnDocument(options.Before),
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return nil, fmt.Errorf("reference not found, already used, or expired")
 	}
-	if used == 1 {
-		return nil, fmt.Errorf("reference already used")
-	}
-	if time.Now().UTC().After(ref.ExpiresAt) {
-		return nil, fmt.Errorf("reference expired")
-	}
-	if _, err := tx.Exec(`UPDATE email_references SET used = 1 WHERE reference = ?`, reference); err != nil {
+	if err != nil {
 		return nil, err
 	}
-	return &ref, tx.Commit()
+	return &EmailReference{
+		Reference: reference,
+		Token:     str(doc, "token"),
+		ExpiresAt: timeVal(doc, "expires_at"),
+	}, nil
 }
 
 // ─────────────────────────────────────────────────────────────
 // SSO state operations
 // ─────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────
-// CSRF operations
-// ─────────────────────────────────────────────────────────────
-
-// CreateCSRF generates a one-time token for the review form.
-// Bound to a specific approval token + manager email — cannot be reused
-// for a different request or by a different person.
-func (s *store) CreateCSRF(approvalToken, managerEmail string) string {
-	csrf := newUUID()
-	expires := time.Now().UTC().Add(30 * time.Minute)
-	s.db.Exec(`
-		INSERT INTO csrf_tokens (token, manager, expires_at) VALUES (?, ?, ?)`,
-		approvalToken+":"+csrf, managerEmail, expires,
-	)
-	return csrf
-}
-
-// ValidateCSRF verifies a CSRF token is valid, unexpired, and single-use.
-// Returns the verified manager email so the decide handler knows who is acting.
-func (s *store) ValidateCSRF(approvalToken, csrf string) (string, error) {
-	key := approvalToken + ":" + csrf
-	row := s.db.QueryRow(`
-		SELECT manager, expires_at, used FROM csrf_tokens WHERE token = ?`, key)
-	var manager string
-	var expiresAt time.Time
-	var used int
-	if err := row.Scan(&manager, &expiresAt, &used); err != nil {
-		return "", fmt.Errorf("invalid csrf")
-	}
-	if used == 1 {
-		return "", fmt.Errorf("csrf already used")
-	}
-	if time.Now().UTC().After(expiresAt) {
-		return "", fmt.Errorf("csrf expired")
-	}
-	s.db.Exec(`UPDATE csrf_tokens SET used = 1 WHERE token = ?`, key)
-	return manager, nil
-}
-
 func (s *store) SaveState(state, reference string) error {
-	_, err := s.db.Exec(`
-		INSERT INTO sso_states (state, reference, created_at) VALUES (?, ?, ?)`,
-		state, reference, time.Now().UTC(),
-	)
+	_, err := s.ssoStates.InsertOne(context.Background(), bson.M{
+		"_id":        state,
+		"reference":  reference,
+		"created_at": time.Now().UTC(),
+	})
 	return err
 }
 
 func (s *store) PopState(state string) (*SSOState, error) {
-	row := s.db.QueryRow(`SELECT state, reference FROM sso_states WHERE state = ?`, state)
-	ss := &SSOState{}
-	if err := row.Scan(&ss.State, &ss.Reference); err != nil {
+	var doc bson.M
+	err := s.ssoStates.FindOneAndDelete(
+		context.Background(),
+		bson.M{"_id": state},
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
 		return nil, fmt.Errorf("state not found or expired")
 	}
-	s.db.Exec(`DELETE FROM sso_states WHERE state = ?`, state)
-	return ss, nil
+	if err != nil {
+		return nil, err
+	}
+	return &SSOState{State: state, Reference: str(doc, "reference")}, nil
+}
+
+// ─────────────────────────────────────────────────────────────
+// CSRF operations
+// ─────────────────────────────────────────────────────────────
+
+func (s *store) CreateCSRF(approvalToken, managerEmail string) string {
+	csrf := newUUID()
+	key := approvalToken + ":" + csrf
+	s.csrfTokens.InsertOne(context.Background(), bson.M{
+		"_id":        key,
+		"manager":    managerEmail,
+		"expires_at": time.Now().UTC().Add(30 * time.Minute),
+		"used":       false,
+	})
+	return csrf
+}
+
+func (s *store) ValidateCSRF(approvalToken, csrf string) (string, error) {
+	key := approvalToken + ":" + csrf
+	var doc bson.M
+	err := s.csrfTokens.FindOneAndUpdate(
+		context.Background(),
+		bson.M{
+			"_id":        key,
+			"used":       false,
+			"expires_at": bson.M{"$gt": time.Now().UTC()},
+		},
+		bson.M{"$set": bson.M{"used": true}},
+	).Decode(&doc)
+	if err == mongo.ErrNoDocuments {
+		return "", fmt.Errorf("invalid or expired csrf")
+	}
+	if err != nil {
+		return "", err
+	}
+	return str(doc, "manager"), nil
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -353,9 +339,6 @@ func (s *store) PopState(state string) (*SSOState, error) {
 // Fix 3: tamper-evident audit trail
 // ─────────────────────────────────────────────────────────────
 
-// WriteAudit appends one audit event.
-// The hash field = SHA-256(event + data + timestamp + previous_hash).
-// Any modification to any past record breaks the chain from that point forward.
 func (s *store) WriteAudit(event string, fields map[string]string) error {
 	data, _ := json.Marshal(fields)
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
@@ -364,67 +347,105 @@ func (s *store) WriteAudit(event string, fields map[string]string) error {
 	content := event + string(data) + timestamp + prevHash
 	hash := sha256hex(content)
 
-	_, err := s.db.Exec(`
-		INSERT INTO audit_log (event, data, timestamp, previous_hash, hash)
-		VALUES (?, ?, ?, ?, ?)`,
-		event, string(data), timestamp, prevHash, hash,
-	)
+	_, err := s.auditLog.InsertOne(context.Background(), bson.M{
+		"event":         event,
+		"data":          string(data),
+		"timestamp":     timestamp,
+		"previous_hash": prevHash,
+		"hash":          hash,
+	})
 	return err
 }
 
-// VerifyChain walks the entire audit log and checks every hash link.
-// Returns the number of records verified, or an error if tampering is detected.
-// Call this from a compliance job or the /audit/verify endpoint.
+// VerifyChain walks every audit record in insertion order and checks every hash.
+// Returns records verified, or an error identifying the first broken link.
 func (s *store) VerifyChain() (int, error) {
-	rows, err := s.db.Query(`
-		SELECT id, event, data, timestamp, previous_hash, hash
-		FROM audit_log ORDER BY id ASC`)
+	cursor, err := s.auditLog.Find(
+		context.Background(),
+		bson.M{},
+		options.Find().SetSort(bson.D{{Key: "_id", Value: 1}}),
+	)
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer cursor.Close(context.Background())
 
 	prevHash := ""
 	count := 0
 
-	for rows.Next() {
-		var id int64
-		var event, data, timestamp, storedPrevHash, storedHash string
-		if err := rows.Scan(&id, &event, &data, &timestamp, &storedPrevHash, &storedHash); err != nil {
+	for cursor.Next(context.Background()) {
+		var doc bson.M
+		if err := cursor.Decode(&doc); err != nil {
 			return count, err
 		}
 
-		// Check the previous_hash field matches what we computed
+		storedPrevHash := str(doc, "previous_hash")
+		storedHash := str(doc, "hash")
+		event := str(doc, "event")
+		data := str(doc, "data")
+		timestamp := str(doc, "timestamp")
+
 		if storedPrevHash != prevHash {
-			return count, fmt.Errorf("chain broken at record id=%d: expected previous_hash=%s got=%s",
-				id, prevHash, storedPrevHash)
+			return count, fmt.Errorf("chain broken at record %v: previous_hash mismatch", doc["_id"])
 		}
 
-		// Recompute this record's hash and check it matches
-		content := event + data + timestamp + storedPrevHash
-		expectedHash := sha256hex(content)
-		if storedHash != expectedHash {
-			return count, fmt.Errorf("hash mismatch at record id=%d: record was tampered with", id)
+		expected := sha256hex(event + data + timestamp + storedPrevHash)
+		if storedHash != expected {
+			return count, fmt.Errorf("hash mismatch at record %v: record was tampered with", doc["_id"])
 		}
 
 		prevHash = storedHash
 		count++
 	}
-	return count, rows.Err()
+	return count, cursor.Err()
 }
 
 func (s *store) lastAuditHash() string {
-	var hash string
-	s.db.QueryRow(`SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1`).Scan(&hash)
-	return hash // empty string for the first record — that is correct
+	var doc bson.M
+	s.auditLog.FindOne(
+		context.Background(),
+		bson.M{},
+		options.FindOne().SetSort(bson.D{{Key: "_id", Value: -1}}),
+	).Decode(&doc)
+	if doc == nil {
+		return ""
+	}
+	return str(doc, "hash")
 }
 
 // ─────────────────────────────────────────────────────────────
-// Helpers
+// bson helpers — keep handler code clean
 // ─────────────────────────────────────────────────────────────
+
+func str(doc bson.M, key string) string {
+	if v, ok := doc[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+func strPtr(doc bson.M, key string) *string {
+	if v, ok := doc[key].(string); ok && v != "" {
+		return &v
+	}
+	return nil
+}
+
+func timeVal(doc bson.M, key string) time.Time {
+	if v, ok := doc[key].(time.Time); ok {
+		return v
+	}
+	return time.Time{}
+}
+
+func timePtr(doc bson.M, key string) *time.Time {
+	if v, ok := doc[key].(time.Time); ok {
+		return &v
+	}
+	return nil
+}
 
 func sha256hex(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
 }
-
