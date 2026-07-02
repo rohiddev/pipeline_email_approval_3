@@ -1,5 +1,5 @@
 # Build stage — pure Go, no CGO needed (MongoDB driver is pure Go)
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23.10-alpine AS builder
 
 WORKDIR /app
 COPY go.mod go.sum ./

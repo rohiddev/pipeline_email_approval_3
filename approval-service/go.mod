@@ -1,6 +1,6 @@
 module approval-service
 
-go 1.22
+go 1.23.10
 
 require go.mongodb.org/mongo-driver v1.15.0
 
