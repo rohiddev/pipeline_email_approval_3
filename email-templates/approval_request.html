@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0">
+  <tr>
+    <td align="center" style="padding:40px 16px;">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:6px;overflow:hidden;
+                    box-shadow:0 1px 4px rgba(0,0,0,0.12);">
+
+        <!-- Header bar -->
+        <tr>
+          <td style="background:#0052cc;padding:24px 32px;">
+            <p style="margin:0;color:#ffffff;font-size:17px;font-weight:bold;
+                      letter-spacing:0.3px;">
+              AD Group Access Request
+            </p>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:32px;">
+
+            <p style="margin:0 0 8px;color:#172b4d;font-size:15px;">Hello,</p>
+            <p style="margin:0 0 24px;color:#172b4d;font-size:15px;">
+              <strong>{{requester_name}}</strong> is requesting access to an AD group
+              that requires your approval.
+            </p>
+
+            <!-- Request detail card -->
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="background:#f4f5f7;border-radius:4px;margin-bottom:28px;">
+              <tr>
+                <td style="padding:20px 24px;">
+                  <table width="100%" cellpadding="0" cellspacing="0">
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 width:130px;vertical-align:top;">Requester</td>
+                      <td style="padding:5px 0;color:#172b4d;font-size:13px;
+                                 font-weight:bold;">{{requester_name}}</td>
+                    </tr>
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 vertical-align:top;">Email</td>
+                      <td style="padding:5px 0;color:#172b4d;font-size:13px;">
+                        {{requester_email}}</td>
+                    </tr>
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 vertical-align:top;">AD Group</td>
+                      <td style="padding:5px 0;color:#172b4d;font-size:13px;
+                                 font-weight:bold;">{{ad_group}}</td>
+                    </tr>
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 vertical-align:top;">Reason</td>
+                      <td style="padding:5px 0;color:#172b4d;font-size:13px;">
+                        {{reason}}</td>
+                    </tr>
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 vertical-align:top;">Requested</td>
+                      <td style="padding:5px 0;color:#172b4d;font-size:13px;">
+                        {{requested_at}}</td>
+                    </tr>
+
+                    <tr>
+                      <td style="padding:5px 0;color:#5e6c84;font-size:13px;
+                                 vertical-align:top;">Link expires</td>
+                      <td style="padding:5px 0;color:#de350b;font-size:13px;
+                                 font-weight:bold;">{{link_expires_at}}</td>
+                    </tr>
+
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Action buttons -->
+            <!-- Both buttons link to the same review URL.
+                 The actual approve / reject decision is made on the
+                 secure review page after SSO login. -->
+            <p style="margin:0 0 16px;color:#172b4d;font-size:14px;">
+              Please review and take action:
+            </p>
+
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="padding-right:12px;">
+                  <a href="{{review_url}}"
+                     style="display:inline-block;background:#0052cc;color:#ffffff;
+                            font-size:14px;font-weight:bold;text-decoration:none;
+                            padding:11px 24px;border-radius:4px;">
+                    Approve
+                  </a>
+                </td>
+                <td>
+                  <a href="{{review_url}}"
+                     style="display:inline-block;background:#ffffff;color:#de350b;
+                            font-size:14px;font-weight:bold;text-decoration:none;
+                            padding:10px 24px;border-radius:4px;
+                            border:2px solid #de350b;">
+                    Reject
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <!-- Security note -->
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="border-left:3px solid #ffab00;margin-bottom:8px;">
+              <tr>
+                <td style="padding:10px 14px;color:#5e6c84;font-size:12px;
+                           line-height:1.6;">
+                  You will be asked to <strong>log in with your corporate account</strong>
+                  before your decision is recorded. Your identity and the time of your
+                  decision are permanently logged for audit purposes.
+                </td>
+              </tr>
+            </table>
+
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f4f5f7;padding:18px 32px;
+                     border-top:1px solid #dfe1e6;">
+            <p style="margin:0;color:#97a0af;font-size:11px;line-height:1.6;">
+              This is an automated message from Platform Engineering.<br>
+              Do not reply to this email —
+              contact <a href="mailto:platform-support@company.com"
+                style="color:#0052cc;text-decoration:none;">
+                platform-support@company.com</a> for help.
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td>
+  </tr>
+</table>
+</body>
+</html>

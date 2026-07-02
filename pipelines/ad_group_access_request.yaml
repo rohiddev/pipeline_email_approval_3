@@ -1,0 +1,388 @@
+pipeline:
+  name: AD Group Access Request
+  identifier: ad_group_access_request
+  projectIdentifier: platform
+  orgIdentifier: default
+  description: User requests AD group access. Manager approves via email link. Group membership added on approval.
+  tags: {}
+
+  variables:
+    - name: requester_username
+      type: String
+      description: Username of the person requesting access (e.g. jsmith)
+    - name: requester_email
+      type: String
+      description: Email address of the requester
+    - name: ad_group
+      type: String
+      description: Name of the AD group to join (e.g. VPN-Users-External)
+    - name: business_reason
+      type: String
+      description: Business justification for the access request
+    - name: manager_email
+      type: String
+      description: Email address of the approving manager
+    - name: approval_service_url
+      type: String
+      description: Base URL of the Go approval service
+      default: "http://approval-service.platform.svc.cluster.local:8000"
+
+  stages:
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 1 - Get an approval token from the Go service
+    # The token is a UUID that ties this pipeline run to the email
+    # the manager will receive. We store the token as an output
+    # variable so all later stages can reference it.
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Generate Approval Token
+        identifier: generate_token
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Create Token
+                  identifier: create_token
+                  type: Http
+                  spec:
+                    url: <+pipeline.variables.approval_service_url>/approval/create
+                    method: POST
+                    headers:
+                      - key: Content-Type
+                        value: application/json
+                      - key: X-Internal-Key
+                        value: <+secrets.getValue("vault://platform/approval_service_internal_key")>
+                    requestBody: >
+                      {
+                        "requester": "<+pipeline.variables.requester_username>",
+                        "requester_email": "<+pipeline.variables.requester_email>",
+                        "manager_email": "<+pipeline.variables.manager_email>",
+                        "ad_group": "<+pipeline.variables.ad_group>",
+                        "reason": "<+pipeline.variables.business_reason>",
+                        "pipeline_execution_id": "<+pipeline.executionId>"
+                      }
+                    assertion: <+httpResponseCode> == 201
+                    outputVariables:
+                      - name: approval_token
+                        value: <+json("$.token")>
+                        type: String
+                      - name: review_url
+                        value: <+json("$.review_url")>
+                        type: String
+                      - name: token_expires_at
+                        value: <+json("$.expires_at")>
+                        type: String
+                  timeout: 30s
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Abort
+
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 2 - Email the manager
+    # The email contains two links:
+    #   /approval/approve/{token}  →  SSO login  →  approve recorded
+    #   /approval/reject/{token}   →  SSO login  →  reject recorded
+    # Manager never needs to log into Harness.
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Email Manager for Approval
+        identifier: send_email
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Send Approval Email
+                  identifier: send_approval_email
+                  type: Http
+                  spec:
+                    url: <+secrets.getValue("vault://platform/email_api_url")>/send
+                    method: POST
+                    headers:
+                      - key: Content-Type
+                        value: application/json
+                      - key: Authorization
+                        value: Bearer <+secrets.getValue("vault://platform/email_api_key")>
+                    requestBody: >
+                      {
+                        "to": "<+pipeline.variables.manager_email>",
+                        "subject": "Action Required - AD Group Access Request from <+pipeline.variables.requester_username>",
+                        "body": "<+pipeline.variables.requester_username> is requesting access to <+pipeline.variables.ad_group>.\n\nReason: <+pipeline.variables.business_reason>\n\nClick below to review and approve or reject this request:\n\n<+pipeline.stages.generate_token.spec.execution.steps.create_token.output.outputVariables.review_url>\n\nThis link expires in 4 hours. The overall request expires at <+pipeline.stages.generate_token.spec.execution.steps.create_token.output.outputVariables.token_expires_at>."
+                      }
+                    assertion: <+httpResponseCode> == 200
+                  timeout: 30s
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Abort
+
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 3 - Wait for the manager to decide
+    # The shell script polls the Go service every 60 seconds.
+    # exit 0  = approved  → pipeline continues to Stage 4
+    # exit 1  = rejected or expired → pipeline aborts
+    # exit 2  = still pending → Harness retries after retryInterval
+    # Timeout is 48 hours (172800 seconds).
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Wait for Manager Approval
+        identifier: wait_for_approval
+        type: Approval
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Poll for Decision
+                  identifier: poll_decision
+                  type: ShellScriptApproval
+                  spec:
+                    scriptTimeout: 172800s
+                    retryInterval: 60s
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          TOKEN="<+pipeline.stages.generate_token.spec.execution.steps.create_token.output.outputVariables.approval_token>"
+                          URL="<+pipeline.variables.approval_service_url>/approval/status/${TOKEN}"
+                          KEY="<+secrets.getValue("vault://platform/approval_service_internal_key")>"
+
+                          RESPONSE=$(curl -sf --retry 3 --retry-delay 5 \
+                            -H "X-Internal-Key: ${KEY}" \
+                            -w "\n%{http_code}" "${URL}")
+
+                          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+                          BODY=$(echo "$RESPONSE" | head -n -1)
+
+                          if [ "$HTTP_CODE" != "200" ]; then
+                            echo "Service returned HTTP ${HTTP_CODE} - will retry"
+                            exit 2
+                          fi
+
+                          STATUS=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+                          echo "Approval status: ${STATUS}"
+
+                          case "$STATUS" in
+                            approved) echo "Manager approved - continuing"; exit 0 ;;
+                            rejected) echo "Manager rejected - aborting";   exit 1 ;;
+                            expired)  echo "Request expired (48h) - aborting"; exit 1 ;;
+                            *)        echo "Still pending - waiting";       exit 2 ;;
+                          esac
+                    delegateSelectors:
+                      - act-delegate-k8s-ephub-p2r1
+                  timeout: 172800s
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Abort
+
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 4 - Add the user to the AD group
+    # Only runs if Stage 3 exits 0 (approved).
+    # Uses K8s service account to authenticate to Vault at runtime
+    # so there is no static credential stored anywhere.
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Add User to AD Group
+        identifier: add_to_ad_group
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Add AD Group Member
+                  identifier: add_ad_member
+                  type: ShellScript
+                  spec:
+                    shell: Bash
+                    onDelegate: true
+                    source:
+                      type: Inline
+                      spec:
+                        script: |
+                          #!/bin/bash
+                          set -euo pipefail
+
+                          # Authenticate to Vault using the delegate pod's K8s service account.
+                          # This avoids storing any long-lived Vault token.
+                          JWT=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+
+                          VAULT_TOKEN=$(curl -sf --retry 3 \
+                            -X POST https://vault.internal/v1/auth/kubernetes/login \
+                            -H "Content-Type: application/json" \
+                            -d "{\"role\":\"platform-delegate\",\"jwt\":\"${JWT}\"}" \
+                            | python3 -c "import sys,json; print(json.load(sys.stdin)['auth']['client_token'])")
+
+                          AD_URL=$(curl -sf --retry 3 \
+                            -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                            https://vault.internal/v1/secret/data/platform/ad_api_url \
+                            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['data']['url'])")
+
+                          AD_KEY=$(curl -sf --retry 3 \
+                            -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                            https://vault.internal/v1/secret/data/platform/ad_api_key \
+                            | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['data']['key'])")
+
+                          RESULT=$(curl -sf --retry 3 --retry-delay 5 \
+                            -w "\n%{http_code}" \
+                            -X POST "${AD_URL}/groups/<+pipeline.variables.ad_group>/members" \
+                            -H "Authorization: Bearer ${AD_KEY}" \
+                            -H "Content-Type: application/json" \
+                            -d "{\"username\":\"<+pipeline.variables.requester_username>\"}")
+
+                          CODE=$(echo "$RESULT" | tail -1)
+                          if [ "$CODE" != "200" ] && [ "$CODE" != "201" ]; then
+                            echo "AD API failed with HTTP ${CODE}"
+                            exit 1
+                          fi
+
+                          echo "Added <+pipeline.variables.requester_username> to <+pipeline.variables.ad_group>"
+                    environmentVariables: []
+                    delegateSelectors:
+                      - act-delegate-k8s-ephub-p2r1
+                  timeout: 5m
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Retry
+                        spec:
+                          retryCount: 2
+                          retryIntervals:
+                            - 30s
+                          onRetryFailure:
+                            action:
+                              type: Abort
+
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Abort
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 5 - Notify the requester that they now have access
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Notify Requester
+        identifier: notify_requester
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Email Requester - Access Granted
+                  identifier: email_requester
+                  type: Http
+                  spec:
+                    url: <+secrets.getValue("vault://platform/email_api_url")>/send
+                    method: POST
+                    headers:
+                      - key: Content-Type
+                        value: application/json
+                      - key: Authorization
+                        value: Bearer <+secrets.getValue("vault://platform/email_api_key")>
+                    requestBody: >
+                      {
+                        "to": "<+pipeline.variables.requester_email>",
+                        "subject": "Access Granted - <+pipeline.variables.ad_group>",
+                        "body": "Your request to join <+pipeline.variables.ad_group> has been approved and your access is now active. Please allow up to 15 minutes for AD sync. Contact platform-support@company.com if you have issues."
+                      }
+                    assertion: <+httpResponseCode> == 200
+                  timeout: 30s
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Ignore
+
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Ignore
+
+    # ─────────────────────────────────────────────────────────────
+    # Stage 6 - Email support if the pipeline fails at any stage
+    # Only runs on failure. Failure here does not block anything.
+    # ─────────────────────────────────────────────────────────────
+    - stage:
+        name: Notify Support on Failure
+        identifier: notify_support_on_failure
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Email Support Team
+                  identifier: email_support
+                  type: Http
+                  spec:
+                    url: <+secrets.getValue("vault://platform/email_api_url")>/send
+                    method: POST
+                    headers:
+                      - key: Content-Type
+                        value: application/json
+                      - key: Authorization
+                        value: Bearer <+secrets.getValue("vault://platform/email_api_key")>
+                    requestBody: >
+                      {
+                        "to": "platform-support@company.com",
+                        "subject": "Pipeline Failed - AD Group Access Request",
+                        "body": "Requester: <+pipeline.variables.requester_username>\nAD Group: <+pipeline.variables.ad_group>\nExecution: https://app.harness.io/ng/#/account/<+account.identifier>/cd/orgs/default/projects/platform/pipelines/ad_group_access_request/executions/<+pipeline.executionId>/pipeline"
+                      }
+                    assertion: <+httpResponseCode> == 200
+                  timeout: 30s
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Ignore
+
+        when:
+          pipelineStatus: Failure
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: Ignore
